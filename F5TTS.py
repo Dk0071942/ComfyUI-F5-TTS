@@ -13,20 +13,53 @@ import sys
 import numpy as np
 import re
 import io
+import torch
 from comfy.utils import ProgressBar
 from cached_path import cached_path
 sys.path.append(Install.f5TTSPath)
-from model import DiT # noqa E402
+from model import DiT,UNetT,CFM # noqa E402
 from model.utils_infer import ( # noqa E402
-    load_model,
+    #    load_model,
     preprocess_ref_audio_text,
     infer_process,
+)
+from model.utils import (
+    load_checkpoint,
+    get_tokenizer,
 )
 sys.path.pop()
 
 
+
 class F5TTSCreate:
     voice_reg = re.compile(r"\{(\w+)\}")
+    model_types = ["F5", "E2"]
+    ode_methods = [
+        "euler",
+        "midpoint",
+        "rk4",
+        "explicit_adams",
+        "implicit_adams",
+
+        # adaptive ode methods gets "underflow in dt" error
+        # https://github.com/rtqichen/torchdiffeq/issues/57
+        # "dopri8",
+        # "dopri5",
+        # "bosh3",
+        # "fehlberg2",
+        # "adaptive_heun",
+
+        # scipy_solvers just uses GPU, doesn't finish
+        # 'scipy_solver:RK45',
+        # 'scipy_solver:RK23',
+        # 'scipy_solver:DOP853',
+        # 'scipy_solver:Radau',
+        # 'scipy_solver:BDF',
+        # 'scipy_solver:LSODA',
+    ]
+
+    tooltip_rtol = "Relative tolerance. Leave at zero for default."
+    tooltip_atol = "Relative tolerance. Leave at zero for default."
 
     def is_voice_name(self, word):
         return self.voice_reg.match(word.strip())
@@ -52,7 +85,44 @@ class F5TTSCreate:
         )
         return main_voice
 
-    def load_model(self):
+    def load_model(self, model, ode_method, rtol, atol):
+        models = {
+            "F5": self.load_f5_model,
+            "E2": self.load_e2_model,
+        }
+        return models[model](ode_method, rtol, atol)
+
+    def load_e2_model(self, ode_method, rtol, atol):
+        model_cls = UNetT
+        model_cfg = dict(dim=1024, depth=24, heads=16, ff_mult=4)
+        repo_name = "E2-TTS"
+        exp_name = "E2TTS_Base"
+        ckpt_step = 1200000
+        ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.safetensors")) # noqa E501
+        vocab_file = self.get_vocab_file()
+        ode_options = {}
+        ode_arr = ode_method.split(":")
+        ode_method2 = ode_method
+        if len(ode_arr) > 1:
+            ode_method2 = ode_arr[0]
+            ode_options["options"] = {}
+            ode_options["options"]["solver"] = ode_arr[1]
+        if rtol != 0:
+            ode_options["rtol"] = rtol
+        if atol != 0:
+            ode_options["atol"] = atol
+        ema_model = self.load_model2(
+            model_cls, model_cfg,
+            ckpt_file, vocab_file, ode_method2, ode_options=ode_options
+            )
+        return ema_model
+
+    def get_vocab_file(self):
+        return os.path.join(
+            Install.f5TTSPath, "data/Emilia_ZH_EN_pinyin/vocab.txt"
+            )
+
+    def load_f5_model(self, ode_method, rtol, atol):
         model_cls = DiT
         model_cfg = dict(
             dim=1024, depth=22, heads=16,
@@ -62,11 +132,63 @@ class F5TTSCreate:
         exp_name = "F5TTS_Base"
         ckpt_step = 1200000
         ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.safetensors")) # noqa E501
-        vocab_file = os.path.join(
-            Install.f5TTSPath, "data/Emilia_ZH_EN_pinyin/vocab.txt"
+        vocab_file = self.get_vocab_file()
+        ode_options = {}
+        ode_arr = ode_method.split(":")
+        ode_method2 = ode_method
+        if len(ode_arr) > 1:
+            ode_method2 = ode_arr[0]
+            ode_options["options"] = {}
+            ode_options["options"]["solver"] = ode_arr[1]
+        if rtol != 0:
+            ode_options["rtol"] = rtol
+        if atol != 0:
+            ode_options["atol"] = atol
+        ema_model = self.load_model2(
+            model_cls, model_cfg,
+            ckpt_file, vocab_file, ode_method2, ode_options=ode_options
             )
-        ema_model = load_model(model_cls, model_cfg, ckpt_file, vocab_file)
         return ema_model
+
+    def load_model2(self, model_cls, model_cfg, ckpt_path, vocab_file="", ode_method="euler", use_ema=True, ode_options={}):
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        target_sample_rate = 24000
+        n_mel_channels = 100
+        hop_length = 256
+        if vocab_file == "":
+            vocab_file = "Emilia_ZH_EN"
+            tokenizer = "pinyin"
+        else:
+            tokenizer = "custom"
+
+        print("\nvocab : ", vocab_file)
+        print("tokenizer : ", tokenizer)
+        print("model : ", ckpt_path, "\n")
+
+        vocab_char_map, vocab_size = get_tokenizer(vocab_file, tokenizer)
+        ode_base_options=dict(
+            method=ode_method,
+        )
+        print(ode_base_options)
+        odeint_kwargs={**ode_base_options, **ode_options}
+        print(odeint_kwargs)
+        model = CFM(
+            transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
+            mel_spec_kwargs=dict(
+                target_sample_rate=target_sample_rate,
+                n_mel_channels=n_mel_channels,
+                hop_length=hop_length,
+            ),
+            odeint_kwargs=odeint_kwargs,
+    #        dict(
+    #            method=ode_method,
+    #        ),
+            vocab_char_map=vocab_char_map,
+        ).to(device)
+
+        model = load_checkpoint(model, ckpt_path, device, use_ema=use_ema)
+
+        return model 
 
     def generate_audio(self, voices, model_obj, chunks):
         frame_rate = 44100
@@ -110,8 +232,8 @@ class F5TTSCreate:
         os.unlink(wave_file.name)
         return audio
 
-    def create(self, voices, chunks):
-        model_obj = self.load_model()
+    def create(self, voices, chunks, model, ode_method, rtol, atol):
+        model_obj = self.load_model(model, ode_method, rtol, atol)
         return self.generate_audio(voices, model_obj, chunks)
 
 
@@ -128,6 +250,19 @@ class F5TTSAudioInputs:
                 "speech": ("STRING", {
                     "multiline": True,
                     "default": "This is what I want to say"
+                }),
+                "model": (F5TTSCreate.model_types,),
+                "ode_method": (
+                    F5TTSCreate.ode_methods,
+                    {"tooltip": "The Ordinary Differential Equation"},
+                    ),
+                "relative_tolerance": ("FLOAT", {
+                    "display": "number", "step": 0.00001,
+                    "tooltip": F5TTSCreate.tooltip_rtol,
+                    }),
+                "absolute_tolerance": ("FLOAT", {
+                    "display": "number", "step": 0.00001,
+                    "tooltip": F5TTSCreate.tooltip_atol,
                 }),
             },
         }
@@ -162,7 +297,12 @@ class F5TTSAudioInputs:
                 print("F5TTS: Cannot remove? "+self.wave_file.name)
                 print(e)
 
-    def create(self, sample_audio, sample_text, speech):
+    def create(
+        self,
+        sample_audio, sample_text, speech,
+        model="F5", ode_method="euler",
+        relative_tolerance=0, absolute_tolerance=0
+    ):
         try:
             main_voice = self.load_voice_from_input(sample_audio, sample_text)
 
@@ -172,17 +312,26 @@ class F5TTSAudioInputs:
             chunks = f5ttsCreate.split_text(speech)
             voices['main'] = main_voice
 
-            audio = f5ttsCreate.create(voices, chunks)
+            audio = f5ttsCreate.create(
+                voices, chunks, model, ode_method,
+                relative_tolerance, absolute_tolerance
+                )
         finally:
             self.remove_wave_file()
         return (audio, )
 
     @classmethod
-    def IS_CHANGED(s, sample_audio, sample_text, speech):
+    def IS_CHANGED(s, sample_audio,
+                   sample_text, speech, ode_method,
+                   relative_tolerance, absolute_tolerance,
+                   ):
         m = hashlib.sha256()
         m.update(sample_text)
         m.update(sample_audio)
         m.update(speech)
+        m.update(ode_method)
+        m.update(relative_tolerance)
+        m.update(absolute_tolerance)
         return m.digest().hex()
 
 
@@ -215,6 +364,25 @@ class F5TTSAudio:
                     "multiline": True,
                     "default": "This is what I want to say"
                 }),
+                "model": (F5TTSCreate.model_types,),
+                "ode_method": (
+                    F5TTSCreate.ode_methods,
+                    {"tooltip": "The Ordinary Differential Equation"},
+                    ),
+                "relative_tolerance": ("FLOAT", {
+                    "display": "number", "step": 0.00001,
+                    "tooltip": F5TTSCreate.tooltip_rtol,
+                    }),
+                "absolute_tolerance": ("FLOAT", {
+                    "display": "number", "step": 0.00001,
+                    "tooltip": F5TTSCreate.tooltip_atol,
+                }),
+                "seed": ("INT", {
+                    "display": "number", "step": 1,
+                }),
+
+
+
             }
         }
 
@@ -271,7 +439,13 @@ class F5TTSAudio:
             voices[voice_name] = self.load_voice_from_file(sample_file)
         return voices
 
-    def create(self, sample, speech):
+    def create(
+        self,
+        sample, speech,
+        model="F5", ode_method="euler",
+        relative_tolerance=0, absolute_tolerance=0,
+        seed=-1
+    ):
         # Install.check_install()
         main_voice = self.load_voice_from_file(sample)
 
@@ -291,11 +465,20 @@ class F5TTSAudio:
             voices = self.load_voices_from_files(sample, voice_names)
             voices['main'] = main_voice
 
-            audio = f5ttsCreate.create(voices, chunks)
+            if seed >= 0:
+                torch.manual_seed(seed)
+            else:
+                torch.random.seed()
+            audio = f5ttsCreate.create(
+                voices, chunks, model, ode_method,
+                relative_tolerance, absolute_tolerance
+            )
         return (audio, )
 
     @classmethod
-    def IS_CHANGED(s, sample, speech):
+    def IS_CHANGED(s, sample, speech, ode_method,
+                   relative_tolerance, absolute_tolerance,
+                   ):
         m = hashlib.sha256()
         audio_path = folder_paths.get_annotated_filepath(sample)
         audio_txt_path = F5TTSAudio.get_txt_file_path(audio_path)
@@ -305,4 +488,7 @@ class F5TTSAudio:
         m.update(str(last_modified_timestamp))
         m.update(str(txt_last_modified_timestamp))
         m.update(speech)
+        m.update(ode_method)
+        m.update(relative_tolerance)
+        m.update(absolute_tolerance)
         return m.digest().hex()
