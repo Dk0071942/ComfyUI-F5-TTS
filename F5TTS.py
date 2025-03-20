@@ -49,6 +49,40 @@ class F5TTSCreate:
     vocoder_types = ["vocos", "bigvgan"]
     tooltip_seed = "Seed. -1 = random"
     tooltip_speed = "Speed. >1.0 slower. <1.0 faster"
+    DEFAULT_MAX_CHARS = 135  # Default maximum characters per chunk
+    
+    # Default model configurations
+    DEFAULT_MODEL_CFG = dict(
+        dim=1024,
+        depth=22,
+        heads=16,
+        ff_mult=2,
+        text_dim=512,
+        text_mask_padding=False,
+        conv_layers=4,
+        pe_attn_head=1,
+    )
+    
+    HINDI_MODEL_CFG = dict(
+        dim=768,
+        depth=18,
+        heads=12,
+        ff_mult=2,
+        text_dim=512,
+        text_mask_padding=False,
+        conv_layers=4,
+        pe_attn_head=1,
+        checkpoint_activations=False,
+    )
+    
+    E2_MODEL_CFG = dict(
+        dim=1024,
+        depth=24,
+        heads=16,
+        ff_mult=4,
+        text_mask_padding=False,
+        pe_attn_head=1,
+    )
 
     def get_model_types():
         model_types = F5TTSCreate.model_types[:]
@@ -88,17 +122,97 @@ class F5TTSCreate:
                 voice_names[match[1]] = True
         return voice_names
 
+    def smart_chunk_text(self, text, max_chars=DEFAULT_MAX_CHARS):
+        """
+        Splits the input text into chunks, each with a maximum number of characters.
+        Respects UTF-8 encoding and natural sentence boundaries.
+
+        Args:
+            text (str): The text to be split.
+            max_chars (int): The maximum number of characters per chunk.
+
+        Returns:
+            List[str]: A list of text chunks.
+        """
+        chunks = []
+        current_chunk = ""
+        
+        # Split the text into sentences based on punctuation followed by whitespace
+        # Handles both English and Chinese punctuation
+        sentences = re.split(r"(?<=[;:,.!?])\s+|(?<=[；：，。！？])", text)
+        
+        for sentence in sentences:
+            # Calculate UTF-8 encoded length of current chunk and sentence
+            current_length = len(current_chunk.encode("utf-8"))
+            sentence_length = len(sentence.encode("utf-8"))
+            
+            # Check if adding this sentence would exceed max_chars
+            if current_length + sentence_length <= max_chars:
+                # Add sentence to current chunk
+                # Add space after sentence if it ends with a single-byte character
+                if sentence and len(sentence[-1].encode("utf-8")) == 1:
+                    current_chunk += sentence + " "
+                else:
+                    current_chunk += sentence
+            else:
+                # Current chunk is full, save it and start a new one
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                # Start new chunk with current sentence
+                current_chunk = sentence + " " if sentence and len(sentence[-1].encode("utf-8")) == 1 else sentence
+        
+        # Add the last chunk if it exists
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+
     def split_text(self, speech):
-        reg1 = r"(?=\{[^\}]+\})"
-        return re.split(reg1, speech)
+        """
+        Splits text into chunks based on voice tags and then applies smart chunking
+        for long text segments.
+        """
+        # First split by voice tags
+        voice_chunks = re.split(r"(?=\{[^\}]+\})", speech)
+        
+        # Process each voice chunk
+        final_chunks = []
+        for chunk in voice_chunks:
+            if not chunk.strip():
+                continue
+                
+            # If chunk contains a voice tag, process it separately
+            if self.is_voice_name(chunk):
+                final_chunks.append(chunk)
+            else:
+                # Apply smart chunking to non-voice-tagged text
+                final_chunks.extend(self.smart_chunk_text(chunk))
+        
+        return final_chunks
 
     @staticmethod
     def load_voice(ref_audio, ref_text):
+        # First get the original audio duration
+        audio, sr = torchaudio.load(ref_audio)
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+        original_duration = audio.shape[-1] / sr
+        
+        # Preprocess the audio
         main_voice = {"ref_audio": ref_audio, "ref_text": ref_text}
-
-        main_voice["ref_audio"], main_voice["ref_text"] = preprocess_ref_audio_text( # noqa E501
+        main_voice["ref_audio"], main_voice["ref_text"] = preprocess_ref_audio_text(
             ref_audio, ref_text
         )
+        
+        # Get the preprocessed audio duration
+        audio, sr = torchaudio.load(main_voice["ref_audio"])
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+        preprocessed_duration = audio.shape[-1] / sr
+        
+        # Calculate the duration ratio
+        main_voice["duration_ratio"] = original_duration / preprocessed_duration
+        
         return main_voice
 
     def get_model_funcs(self):
@@ -119,7 +233,7 @@ class F5TTSCreate:
         elif vocoder_name == "bigvgan":
             os.path.join(Install.f5TTSPath, "checkpoints/bigvgan_v2_24khz_100band_256x") # noqa E501
 
-    def load_vocoder(self,  vocoder_name):
+    def load_vocoder(self, vocoder_name):
         sys.path.insert(0, f5tts_path)
         vocoder = load_vocoder(vocoder_name=vocoder_name)
         sys.path.remove(f5tts_path)
@@ -139,14 +253,6 @@ class F5TTSCreate:
 
     def load_e2_model(self, vocoder):
         model_cls = UNetT
-        model_cfg = dict(
-            dim=1024,
-            depth=24,
-            heads=16,
-            ff_mult=4,
-            text_mask_padding=False,
-            pe_attn_head=1,
-            )
         repo_name = "E2-TTS"
         exp_name = "E2TTS_Base"
         ckpt_step = 1200000
@@ -154,10 +260,12 @@ class F5TTSCreate:
         vocab_file = self.get_vocab_file()
         vocoder_name = "vocos"
         ema_model = load_model(
-            model_cls, model_cfg,
-            ckpt_file, vocab_file=vocab_file,
+            model_cls, 
+            self.E2_MODEL_CFG,
+            ckpt_file, 
+            vocab_file=vocab_file,
             mel_spec_type=vocoder_name,
-            )
+        )
         vocoder = self.load_vocoder(vocoder_name)
         return (ema_model, vocoder, vocoder_name)
 
@@ -174,6 +282,7 @@ class F5TTSCreate:
         return self.load_f5_model_url(
             f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.{extension}", # noqa E501
             vocoder,
+            model_cfg=self.DEFAULT_MODEL_CFG,
         )
 
     def load_f5_model_jp(self, vocoder):
@@ -225,40 +334,22 @@ class F5TTSCreate:
         return str(cached_path(url)) # noqa E501
 
     def load_f5_model_hi(self, vocoder):
-        model_cfg = dict(
-            dim=768,
-            depth=18,
-            heads=12,
-            ff_mult=2,
-            text_dim=512,
-            text_mask_padding=False,
-            conv_layers=4,
-            pe_attn_head=1,
-            checkpoint_activations=False,
-            )
         return self.load_f5_model_url(
             "hf://SPRINGLab/F5-Hindi-24KHz/model_2500000.safetensors",
             "vocos",
             "hf://SPRINGLab/F5-Hindi-24KHz/vocab.txt",
-            model_cfg=model_cfg,
-            )
+            model_cfg=self.HINDI_MODEL_CFG,
+        )
 
     def load_f5_model_url(
         self, url, vocoder_name, vocab_url=None, model_cfg=None
     ):
         vocoder = self.load_vocoder(vocoder_name)
         model_cls = DiT
+        
+        # Use default model configuration if none provided
         if model_cfg is None:
-            model_cfg = dict(
-                dim=1024,
-                depth=22,
-                heads=16,
-                ff_mult=2,
-                text_dim=512,
-                text_mask_padding=False,
-                conv_layers=4,
-                pe_attn_head=1,
-                )
+            model_cfg = self.DEFAULT_MODEL_CFG
 
         ckpt_file = str(self.cached_path(url)) # noqa E501
 
@@ -269,16 +360,21 @@ class F5TTSCreate:
                 vocab_file = self.get_vocab_file()
         else:
             vocab_file = str(self.cached_path(vocab_url))
+
+        # Load model with proper configuration
         ema_model = load_model(
-            model_cls, model_cfg,
-            ckpt_file, vocab_file=vocab_file,
+            model_cls, 
+            model_cfg,
+            ckpt_file, 
+            vocab_file=vocab_file,
             mel_spec_type=vocoder_name,
-            )
+        )
         return (ema_model, vocoder, vocoder_name)
 
     def generate_audio(
         self, voices, model_obj, chunks, seed, vocoder, mel_spec_type,
-        speed
+        speed, cross_fade_duration=0.15, nfe_step=32, max_retries=3,
+        cfg_strength=2.0, sway_sampling_coef=-1.0
     ):
         if seed >= 0:
             torch.manual_seed(seed)
@@ -288,7 +384,42 @@ class F5TTSCreate:
         frame_rate = 44100
         generated_audio_segments = []
         pbar = ProgressBar(len(chunks))
+        
+        print("\n=== F5TTS Audio Generation Debug Info ===")
+        print(f"Total chunks to process: {len(chunks)}")
+        print(f"Cross-fade duration: {cross_fade_duration}")
+        print(f"NFE steps: {nfe_step}")
+        print(f"Speed: {speed}")
+        print(f"CFG strength: {cfg_strength}")
+        print(f"Sway sampling coefficient: {sway_sampling_coef}")
+        
+        # Get reference audio info
+        ref_audio = None
+        ref_text = None
+        voice = "main"
+        
         for text in chunks:
+            match = self.is_voice_name(text)
+            if match:
+                voice = match[1]
+            if voice not in voices:
+                voice = "main"
+            if ref_audio is None:
+                ref_audio = voices[voice]["ref_audio"]
+                ref_text = voices[voice]["ref_text"]
+                # Check input audio duration
+                audio, sr = torchaudio.load(ref_audio)
+                if audio.shape[0] > 1:
+                    audio = torch.mean(audio, dim=0, keepdim=True)
+                duration = audio.shape[-1] / sr
+                if duration > 12:
+                    print(f"\nERROR: Input audio duration ({duration:.2f}s) exceeds maximum allowed duration (12s)")
+                    print("Please use a shorter input audio or trim it to 12 seconds or less")
+                    return None
+        
+        # Process each chunk
+        for i, text in enumerate(chunks):
+            print(f"\n--- Processing chunk {i+1}/{len(chunks)} ---")
             match = self.is_voice_name(text)
             if match:
                 voice = match[1]
@@ -298,44 +429,73 @@ class F5TTSCreate:
             if voice not in voices:
                 print(f"Voice {voice} not found, using main.")
                 voice = "main"
+                
             text = F5TTSCreate.voice_reg.sub("", text)
             gen_text = text.strip()
             if gen_text == "":
                 print(f"No text for {voice}, skip")
                 continue
+                
             ref_audio = voices[voice]["ref_audio"]
             ref_text = voices[voice]["ref_text"]
             print(f"Voice: {voice}")
-            print("text:"+text)
-            audio, final_sample_rate, spectragram = infer_process(
-                ref_audio, ref_text, gen_text, model_obj,
-                vocoder=vocoder, mel_spec_type=mel_spec_type,
-                device=comfy.model_management.get_torch_device(),
-                )
-            generated_audio_segments.append(audio)
-            frame_rate = final_sample_rate
+            print(f"Text to generate: {gen_text}")
+            
+            # Generate audio with retry logic
+            retry_count = 0
+            while retry_count < max_retries:
+                try:
+                    audio, final_sample_rate, spectragram = infer_process(
+                        ref_audio, ref_text, gen_text, model_obj,
+                        vocoder=vocoder, mel_spec_type=mel_spec_type,
+                        device=comfy.model_management.get_torch_device(),
+                        cross_fade_duration=cross_fade_duration,
+                        nfe_step=nfe_step,
+                        speed=speed,
+                        cfg_strength=cfg_strength,
+                        sway_sampling_coef=sway_sampling_coef
+                    )
+                    
+                    print(f"Generated audio length: {len(audio)/final_sample_rate:.2f}s")
+                    generated_audio_segments.append(audio)
+                    frame_rate = final_sample_rate
+                    break  # Success, exit retry loop
+                    
+                except Exception as e:
+                    print(f"Error generating audio: {str(e)}")
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        print(f"Failed to generate audio after {max_retries} attempts")
+                        return None
+                    # Adjust parameters for retry
+                    cross_fade_duration *= 0.8
+                    nfe_step *= 2
+                    print(f"Retrying with adjusted parameters (attempt {retry_count + 1}/{max_retries})")
+            
             pbar.update(1)
 
         if generated_audio_segments:
+            print("\n=== Final Audio Generation ===")
             final_wave = np.concatenate(generated_audio_segments)
-        #if speed != 1.0:
-        #    final_wave = librosa.effects.time_stretch(final_wave, rate=speed)
-        # wave_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        # sf.write(wave_file.name, final_wave, frame_rate)
-        # wave_file.close()
+            total_duration = len(final_wave) / frame_rate
+            print(f"Total audio duration: {total_duration:.2f}s")
+            print(f"Total segments: {len(generated_audio_segments)}")
+        else:
+            print("\nERROR: No audio segments were generated")
+            return None
 
-        # waveform, sample_rate = torchaudio.load(wave_file.name)
         waveform = torch.from_numpy(final_wave).unsqueeze(0)
         audio = {
             "waveform": waveform.unsqueeze(0),
             "sample_rate": frame_rate
-            }
-        # os.unlink(wave_file.name)
+        }
+        print("\n=== Generation Complete ===")
         return audio
 
     def create(
         self, voices, chunks, seed=-1, model="F5",
-        vocoder_name="vocos", speed=1
+        vocoder_name="vocos", speed=1, cross_fade_duration=0.15, nfe_step=32,
+        cfg_strength=2.0, sway_sampling_coef=-1.0
     ):
         (
             model_obj,
@@ -348,6 +508,10 @@ class F5TTSCreate:
             chunks, seed,
             vocoder, mel_spec_type=mel_spec_type,
             speed=speed,
+            cross_fade_duration=cross_fade_duration,
+            nfe_step=nfe_step,
+            cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef
         )
 
     def time_shift(self, audio, speed):
@@ -394,6 +558,22 @@ class F5TTSAudioInputs:
                     "tooltip": F5TTSCreate.tooltip_speed,
                 }),
             },
+            "optional": {
+                "cfg_strength": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.0,
+                    "max": 10.0,
+                    "step": 0.1,
+                    "tooltip": "Classifier-free guidance strength. Higher values amplify the characteristics of the reference voice.",
+                }),
+                "sway_sampling_coef": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -5.0,
+                    "max": 5.0,
+                    "step": 0.1,
+                    "tooltip": "Sway sampling coefficient. Affects the stability of the generated audio.",
+                }),
+            }
         }
 
     CATEGORY = "audio"
@@ -438,7 +618,7 @@ class F5TTSAudioInputs:
         self,
         sample_audio, sample_text,
         speech, seed=-1, model="F5", vocoder="vocos",
-        speed=1
+        speed=1, cfg_strength=2.0, sway_sampling_coef=-1.0
     ):
         try:
             main_voice = self.load_voice_from_input(sample_audio, sample_text)
@@ -450,7 +630,8 @@ class F5TTSAudioInputs:
             voices['main'] = main_voice
 
             audio = f5ttsCreate.create(
-                voices, chunks, seed, model, vocoder, speed
+                voices, chunks, seed, model, vocoder, speed,
+                cfg_strength=cfg_strength, sway_sampling_coef=sway_sampling_coef
             )
             if speed != 1:
                 audio = f5ttsCreate.time_shift(audio, speed)
@@ -461,16 +642,19 @@ class F5TTSAudioInputs:
     @classmethod
     def IS_CHANGED(
         s, sample_audio, sample_text,
-        speech, seed, model, vocoder, speed
+        speech, seed, model, vocoder, speed,
+        cfg_strength=2.0, sway_sampling_coef=-1.0
     ):
         m = hashlib.sha256()
-        m.update(sample_text)
-        m.update(sample_audio)
-        m.update(speech)
-        m.update(seed)
-        m.update(model)
-        m.update(vocoder)
-        m.update(speed)
+        m.update(str(sample_text).encode('utf-8'))
+        m.update(str(sample_audio).encode('utf-8'))
+        m.update(str(speech).encode('utf-8'))
+        m.update(str(seed).encode('utf-8'))
+        m.update(str(model).encode('utf-8'))
+        m.update(str(vocoder).encode('utf-8'))
+        m.update(str(speed).encode('utf-8'))
+        m.update(str(cfg_strength).encode('utf-8'))
+        m.update(str(sway_sampling_coef).encode('utf-8'))
         return m.digest().hex()
 
 
@@ -523,6 +707,22 @@ class F5TTSAudio:
                 "speed": ("FLOAT", {
                     "default": 1.0,
                     "tooltip": F5TTSCreate.tooltip_speed,
+                }),
+            },
+            "optional": {
+                "cfg_strength": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.0,
+                    "max": 10.0,
+                    "step": 0.1,
+                    "tooltip": "Classifier-free guidance strength. Higher values amplify the characteristics of the reference voice.",
+                }),
+                "sway_sampling_coef": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -5.0,
+                    "max": 5.0,
+                    "step": 0.1,
+                    "tooltip": "Sway sampling coefficient. Affects the stability of the generated audio.",
                 }),
             }
         }
@@ -585,7 +785,7 @@ class F5TTSAudio:
     def create(
        self,
        sample, speech, seed=-2, model="F5", vocoder="vocos",
-       speed=1
+       speed=1, cfg_strength=2.0, sway_sampling_coef=-1.0
     ):
         # vocoder = "vocos"
         # Install.check_install()
@@ -598,24 +798,30 @@ class F5TTSAudio:
         voices = self.load_voices_from_files(sample, voice_names)
         voices['main'] = main_voice
 
-        audio = f5ttsCreate.create(voices, chunks, seed, model, vocoder, speed)
+        audio = f5ttsCreate.create(
+            voices, chunks, seed, model, vocoder, speed,
+            cfg_strength=cfg_strength, sway_sampling_coef=sway_sampling_coef
+        )
         if speed != 1:
             audio = f5ttsCreate.time_shift(audio, speed)
         return (audio, )
 
     @classmethod
-    def IS_CHANGED(s, sample, speech, seed, model, vocoder, speed):
+    def IS_CHANGED(s, sample, speech, seed, model, vocoder, speed,
+                  cfg_strength=2.0, sway_sampling_coef=-1.0):
         m = hashlib.sha256()
         audio_path = folder_paths.get_annotated_filepath(sample)
         audio_txt_path = F5TTSCreate.get_txt_file_path(audio_path)
         last_modified_timestamp = os.path.getmtime(audio_path)
         txt_last_modified_timestamp = os.path.getmtime(audio_txt_path)
-        m.update(audio_path)
-        m.update(str(last_modified_timestamp))
-        m.update(str(txt_last_modified_timestamp))
-        m.update(speech)
-        m.update(seed)
-        m.update(model)
-        m.update(vocoder)
-        m.update(speed)
+        m.update(audio_path.encode('utf-8'))
+        m.update(str(last_modified_timestamp).encode('utf-8'))
+        m.update(str(txt_last_modified_timestamp).encode('utf-8'))
+        m.update(str(speech).encode('utf-8'))
+        m.update(str(seed).encode('utf-8'))
+        m.update(str(model).encode('utf-8'))
+        m.update(str(vocoder).encode('utf-8'))
+        m.update(str(speed).encode('utf-8'))
+        m.update(str(cfg_strength).encode('utf-8'))
+        m.update(str(sway_sampling_coef).encode('utf-8'))
         return m.digest().hex()
